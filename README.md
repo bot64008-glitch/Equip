@@ -1,4 +1,4 @@
--- God Rock Smart Equip v5
+-- God Rock Smart Equip v6
 -- Новое: ОБУЧЕНИЕ (скрипт запоминает, как ты экипируешь вручную), СКАН (отчёт в буфер),
 -- вызов модулей игры, поиск не только Tool, более безопасные клики.
 
@@ -60,42 +60,116 @@ local function heldAny()
     end
 end
 
--- предмет, который не Tool (Model/Accessory/деталь) и появился ПОСЛЕ снимка
-local baseline = {}
-local function snapshotBaseline()
-    baseline = {}
+-- В этой игре предметы - Model (папка Tools), а не Tool, поэтому "в руках" определяем по нескольким признакам.
+local childBase = {}
+local function snapshotChildren()
+    childBase = {}
     local ok, c = pcall(getChar)
     if not ok or not c then return end
-    for _, v in ipairs(c:GetDescendants()) do
-        if match(v.Name) then baseline[v] = true end
+    for _, v in ipairs(c:GetChildren()) do childBase[v] = true end
+end
+local function snapshotBaseline() snapshotChildren() end
+
+-- новый прямой потомок персонажа (Model/Tool/Accessory) после экипировки
+local function newChild()
+    for _, v in ipairs(getChar():GetChildren()) do
+        if not childBase[v] and (v:IsA("Tool") or v:IsA("Model") or v:IsA("Accessory")) then return v end
     end
 end
+
+local STORAGE_WORDS = {"tools", "bag", "pouch", "inventory", "backpack", "storage", "pets", "hotbar", "stash"}
+local function inStorage(v, root)
+    local x = v.Parent
+    while x and x ~= root do
+        local n = norm(x.Name)
+        for _, w in ipairs(STORAGE_WORDS) do
+            if n:find(w, 1, true) then return true end
+        end
+        x = x.Parent
+    end
+    return false
+end
+
+-- Model/Accessory/деталь с именем предмета вне папок-хранилищ
 local function nonToolMatch()
-    for _, v in ipairs(getChar():GetDescendants()) do
-        if not baseline[v] and match(v.Name) and (v:IsA("Model") or v:IsA("Accessory") or v:IsA("BasePart")) then
+    local c = getChar()
+    for _, v in ipairs(c:GetDescendants()) do
+        if match(v.Name) and (v:IsA("Model") or v:IsA("Accessory") or v:IsA("BasePart")) and not inStorage(v, c) then
             if not (v:IsA("BasePart") and v.Transparency >= 1) then return v end
         end
     end
 end
 
+-- атрибут / StringValue / ObjectValue с именем предмета вне хранилищ
+local function valueMatch()
+    local c = getChar()
+    for _, val in pairs(c:GetAttributes()) do
+        if type(val) == "string" and match(val) then return c end
+    end
+    for _, d in ipairs(c:GetDescendants()) do
+        if d:IsA("StringValue") and d.Value ~= "" and match(d.Value) and not inStorage(d, c) then return d end
+        if d:IsA("ObjectValue") and d.Value and match(d.Value.Name) and not inStorage(d, c) then return d end
+    end
+end
+
+-- заголовок тулбара в GUI (показывает название предмета в руках)
+local titleCache, titleT = {}, 0
+local function titleSig()
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    if not pg then return "" end
+    if os.clock() - titleT > 3 then
+        titleT = os.clock()
+        titleCache = {}
+        for _, v in ipairs(pg:GetDescendants()) do
+            if v:IsA("TextLabel") and foreign(v) and norm(v.Name) == "title"
+                and norm(v:GetFullName()):find("toolbar", 1, true) then
+                table.insert(titleCache, v)
+            end
+        end
+    end
+    local parts = {}
+    for _, v in ipairs(titleCache) do
+        if v.Parent then parts[#parts + 1] = v.Text end
+    end
+    return table.concat(parts, "|")
+end
+
 local slotToolName = nil
+local lastAssumed = false
+local preTitleSig = ""
 
 local function held()
-    local t = heldAny()
     if MODE == "slot" then
+        local t = heldAny() or newChild()
         if t and (not slotToolName or t.Name == slotToolName) then return t end
         return nil
     end
     for _, v in ipairs(getChar():GetChildren()) do
         if v:IsA("Tool") and match(v.Name) then return v end
     end
-    return nonToolMatch()
+    return nonToolMatch() or valueMatch()
+end
+
+-- для режима "Держать": заголовок тулбара тоже считается признаком
+local function isHeldNow()
+    if held() then return true end
+    return MODE == "item" and match(titleSig())
+end
+
+-- проверка успеха после действия
+local function verified()
+    if held() then return true end
+    local ts = titleSig()
+    if ts ~= preTitleSig and ts ~= "" then
+        if MODE == "slot" or match(ts) then return true end
+    end
+    return false
 end
 
 local function waitHeld(t)
     local t0 = os.clock()
     while os.clock() - t0 < (t or 0.6) do
-        if held() then return true end
+        if verified() then return true end
         task.wait(0.05)
     end
     return false
@@ -170,7 +244,8 @@ local goodSlotPaths = {}     -- то же для кнопок слотов
 
 -- не нажимаем на магазины, обмены, яйца и т.п.
 local BAD_WORDS = {"shop", "store", "buy", "purchase", "market", "trade", "sell", "gift",
-    "robux", "crate", "egg", "auction", "gamepass", "codex"}
+    "robux", "crate", "egg", "auction", "gamepass", "codex", "craft", "mojo", "quest",
+    "recipe", "upgrade", "enchant", "forge", "fuse", "combine", "claim"}
 local function isBad(o)
     local x = o
     while x and not x:IsA("PlayerGui") do
@@ -547,6 +622,115 @@ local function method_gc()
     return false
 end
 
+-- ---------- умные ремоуты (только безопасные, с аргументами под игру) ----------
+
+local function findItemModel()
+    local c = getChar()
+    for _, v in ipairs(c:GetDescendants()) do
+        if (v:IsA("Model") or v:IsA("Tool")) and match(v.Name) then return v end
+    end
+    local wp = workspace:FindFirstChild("Players")
+    local mine = wp and wp:FindFirstChild(player.Name)
+    if mine then
+        for _, v in ipairs(mine:GetDescendants()) do
+            if (v:IsA("Model") or v:IsA("Tool")) and match(v.Name) then return v end
+        end
+    end
+end
+
+local cachedId, idSearched = nil, false
+local function findItemId()
+    if idSearched then return cachedId end
+    idSearched = true
+    local mods = RS:FindFirstChild("Modules")
+    if not mods then return nil end
+    for _, nm in ipairs({"ItemIDS", "ItemData"}) do
+        local m = mods:FindFirstChild(nm)
+        if m and m:IsA("ModuleScript") then
+            local t = safeRequire(m)
+            if type(t) == "table" then
+                for k, v in pairs(t) do
+                    if type(k) == "string" and match(k) and (type(v) == "number" or type(v) == "string") then
+                        cachedId = v
+                        log("ID предмета:", nm, k, v)
+                        return cachedId
+                    end
+                    if type(k) == "number" and type(v) == "string" and match(v) then
+                        cachedId = k
+                        log("ID предмета:", nm, k, v)
+                        return cachedId
+                    end
+                    if type(v) == "table" then
+                        local n2 = v.Name or v.name or v.DisplayName
+                        if type(n2) == "string" and match(n2) then
+                            cachedId = v.ID or v.Id or v.id or k
+                            log("ID предмета:", nm, tostring(cachedId))
+                            return cachedId
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ТОЛЬКО эти ремоуты (Drop/Throw/Craft/Purchase/Swap и прочие не трогаем)
+local EQUIP_REMOTE_NAMES = {"equiptool", "equipitem", "toolswapfrombag", "selecttool", "holdtool", "equipslot", "equip"}
+local function equipRemoteRank(name)
+    local n = norm(name)
+    for i, w in ipairs(EQUIP_REMOTE_NAMES) do
+        if n == w then return i end
+    end
+    return nil
+end
+
+local function smart_remotes()
+    local model = findItemModel()
+    local id = findItemId()
+    local v = {}
+    if MODE == "slot" then
+        v = {{SLOT}, {tostring(SLOT)}, {SLOT, true}}
+    else
+        if model then table.insert(v, {model}) end
+        table.insert(v, {ITEM_NAME})
+        if id ~= nil then
+            table.insert(v, {id})
+            table.insert(v, {ITEM_NAME, id})
+            table.insert(v, {id, ITEM_NAME})
+        end
+        if model and model.Name ~= ITEM_NAME then table.insert(v, {model.Name}) end
+        table.insert(v, {SLOT, ITEM_NAME})
+        table.insert(v, {ITEM_NAME, SLOT})
+    end
+
+    local list = {}
+    for _, r in ipairs(RS:GetDescendants()) do
+        if (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
+            local rank = equipRemoteRank(r.Name)
+            if rank then table.insert(list, {r = r, rank = rank}) end
+        end
+    end
+    table.sort(list, function(a, b) return a.rank < b.rank end)
+    log("Безопасных ремоутов:", #list, "модель:", model and model:GetFullName() or "нет", "id:", tostring(id))
+
+    for _, it in ipairs(list) do
+        for i, args in ipairs(v) do
+            if not alive then return false end
+            local r = it.r
+            pcall(function()
+                if r:IsA("RemoteEvent") then r:FireServer(table.unpack(args))
+                else r:InvokeServer(table.unpack(args)) end
+            end)
+            if waitHeld(0.9) then
+                log("Сработал ремоут:", r:GetFullName(), "вариант", i)
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- ---------- ОБУЧЕНИЕ ----------
 
 local learning = false
@@ -602,19 +786,62 @@ local function installHook()
     return ok
 end
 
+local LEARN_SKIP = {"drop", "throw", "craft", "purchase", "buy", "sell", "trade", "unequip",
+    "swing", "cosmetic", "music", "mouse", "camera", "move", "ping", "request"}
+local function learnSkip(name)
+    local n = norm(name)
+    for _, w in ipairs(LEARN_SKIP) do
+        if n:find(w, 1, true) then return true end
+    end
+    return false
+end
+local function learnWanted(name)
+    local n = norm(name)
+    for _, w in ipairs({"equip", "swap", "select", "hold", "retool", "target", "tool", "bag", "item"}) do
+        if n:find(w, 1, true) then return true end
+    end
+    return false
+end
+
+local function fmtArg(v, depth)
+    depth = depth or 0
+    local t = typeof(v)
+    if t == "string" then
+        return '"' .. v .. '"'
+    elseif t == "Instance" then
+        return "<" .. v.ClassName .. " " .. v:GetFullName() .. ">"
+    elseif t == "table" then
+        if depth > 1 then return "{...}" end
+        local parts, n = {}, 0
+        for k, x in pairs(v) do
+            n = n + 1
+            if n > 6 then
+                parts[#parts + 1] = "..."
+                break
+            end
+            parts[#parts + 1] = tostring(k) .. "=" .. fmtArg(x, depth + 1)
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+    return tostring(v)
+end
+
+local function fmtCall(c)
+    local parts = {}
+    for i = 1, c.args.n do parts[i] = fmtArg(c.args[i]) end
+    return c.remote:GetFullName() .. "(" .. table.concat(parts, ", ") .. ")"
+end
+
 local function startLearn()
     if learning then return end
-    if heldAny() then
+    if heldAny() or held() then
         status("Сними предмет вручную (как обычно)...")
         local w0 = os.clock()
-        while alive and heldAny() and os.clock() - w0 < 15 do task.wait(0.2) end
-        if heldAny() then
-            status("Обучение отменено: предмет всё ещё в руках")
-            return
-        end
+        while alive and (heldAny() or held()) and os.clock() - w0 < 15 do task.wait(0.2) end
         task.wait(0.5)
     end
-    snapshotBaseline()
+    snapshotChildren()
+    local sig0 = titleSig()
     learnCalls, learnClicks, learnKeys = {}, {}, {}
     learning = true
     status("ОБУЧЕНИЕ: экипируй предмет вручную (20 сек)")
@@ -651,99 +878,112 @@ local function startLearn()
     end)
 
     local t0 = os.clock()
-    local tHeld = nil
+    local tEnd = nil
     while alive and os.clock() - t0 < 20 do
         task.wait(0.1)
-        if heldAny() then tHeld = os.clock() break end
+        local gotCall = false
+        for _, c in ipairs(learnCalls) do
+            local okn, nm = pcall(function() return c.remote.Name end)
+            if okn and learnWanted(nm) and not learnSkip(nm) then
+                gotCall = true
+                break
+            end
+        end
+        local changed = (heldAny() ~= nil) or (newChild() ~= nil) or (titleSig() ~= sig0)
+        if gotCall or (changed and (#learnClicks > 0 or #learnKeys > 0)) then
+            tEnd = os.clock()
+            break
+        end
     end
-    task.wait(0.3)
+    task.wait(1.0)
     conn:Disconnect()
     learning = false
 
-    local tool = heldAny()
-    if not tool or not tHeld then
-        status("Обучение: экипировка не замечена")
+    if not tEnd then
+        status("Обучение: действий не заметил" .. (hookOk and "" or " (перехват ремоутов недоступен)"))
         return
     end
 
-    -- запоминаем предмет
-    if MODE == "slot" then
-        slotToolName = tool.Name
-    elseif not match(tool.Name) then
-        ITEM_NAME = tool.Name
-        TARGET = norm(ITEM_NAME)
-        if itemBoxRef then itemBoxRef.Text = ITEM_NAME end
-    end
-
-    -- берём только действия перед самой экипировкой
     learned = {remotes = {}, clicks = {}, keys = {}}
     local seenCall = {}
     for _, c in ipairs(learnCalls) do
-        if c.t >= tHeld - 3 then
+        local okn, nm = pcall(function() return c.remote.Name end)
+        if okn and c.t >= tEnd - 4 and learnWanted(nm) and not learnSkip(nm) then
             local key = tostring(c.remote) .. "#" .. ser(c.args)
-            if not seenCall[key] and #learned.remotes < 8 then
+            if not seenCall[key] and #learned.remotes < 6 then
                 seenCall[key] = true
                 table.insert(learned.remotes, {remote = c.remote, args = c.args})
             end
         end
     end
     for _, c in ipairs(learnClicks) do
-        if c.t >= tHeld - 6 and #learned.clicks < 6 then
+        if c.t >= tEnd - 6 and #learned.clicks < 6 then
             table.insert(learned.clicks, c)
         end
     end
     for _, k in ipairs(learnKeys) do
-        if k.t >= tHeld - 3 and #learned.keys < 4 then
+        if k.t >= tEnd - 3 and #learned.keys < 4 then
             table.insert(learned.keys, k.key)
         end
     end
 
+    local rep = {"=== LEARNED ==="}
+    for _, c in ipairs(learned.remotes) do rep[#rep + 1] = "remote " .. fmtCall(c) end
+    for _, c in ipairs(learned.clicks) do rep[#rep + 1] = "click " .. table.concat(c.path, ".") end
+    for _, k in ipairs(learned.keys) do rep[#rep + 1] = "key " .. tostring(k) end
+    local text = table.concat(rep, "\n")
+    print(text)
+    for _, l in ipairs(rep) do log(l) end
+    local copied = false
+    if typeof(setclipboard) == "function" then
+        copied = pcall(setclipboard, text)
+    end
+
     local msg = "Запомнил: ремоутов " .. #learned.remotes .. ", кликов " .. #learned.clicks .. ", клавиш " .. #learned.keys
+    if copied then msg = msg .. " (в буфере)" end
     if not hookOk then msg = msg .. " (перехват ремоутов недоступен)" end
     status(msg)
-    for _, c in ipairs(learned.remotes) do log("learn remote:", c.remote:GetFullName(), ser(c.args)) end
-    for _, c in ipairs(learned.clicks) do log("learn click:", table.concat(c.path, ".")) end
 end
 
 local function learned_replay()
     if #learned.clicks == 0 and #learned.remotes == 0 and #learned.keys == 0 then return false end
 
-    -- 1) повтор кликов по порядку
+    -- Повторяем ОДИН тип действий (ремоуты > клики > клавиши), чтобы не переключить дважды.
+    if #learned.remotes > 0 then
+        for _, c in ipairs(learned.remotes) do
+            if not alive then return false end
+            pcall(function()
+                if c.remote.ClassName == "RemoteEvent" then
+                    c.remote:FireServer(table.unpack(c.args, 1, c.args.n))
+                else
+                    c.remote:InvokeServer(table.unpack(c.args, 1, c.args.n))
+                end
+            end)
+            task.wait(0.15)
+        end
+        if waitHeld(1.2) then return true end
+        return true, true
+    end
+
     if #learned.clicks > 0 then
         for _, c in ipairs(learned.clicks) do
             if not alive then return false end
             local b = (c.inst and c.inst.Parent) and c.inst or resolvePath(c.path)
             if b then
                 clickOnce(b)
-                task.wait(0.3)
+                task.wait(0.35)
             end
-            if held() then return true end
         end
-        if waitHeld(0.8) then return true end
+        if waitHeld(1.2) then return true end
+        return true, true
     end
 
-    -- 2) повтор ремоутов по одному
-    for _, c in ipairs(learned.remotes) do
-        if not alive then return false end
-        pcall(function()
-            if c.remote.ClassName == "RemoteEvent" then
-                c.remote:FireServer(table.unpack(c.args, 1, c.args.n))
-            else
-                c.remote:InvokeServer(table.unpack(c.args, 1, c.args.n))
-            end
-        end)
-        if waitHeld(0.6) then return true end
+    for _, k in ipairs(learned.keys) do
+        tapKey(k)
+        task.wait(0.15)
     end
-
-    -- 3) повтор клавиш
-    if #learned.keys > 0 then
-        for _, k in ipairs(learned.keys) do
-            tapKey(k)
-            task.wait(0.15)
-        end
-        if waitHeld(0.6) then return true end
-    end
-    return false
+    if waitHeld(1.2) then return true end
+    return true, true
 end
 
 -- ---------- СКАН ----------
@@ -818,6 +1058,26 @@ local function scan()
         end
     end
 
+    add("-- Модель предмета / ID:")
+    local mdl = findItemModel()
+    add("  модель: " .. (mdl and mdl:GetFullName() or "нет") .. "  id: " .. tostring(findItemId()))
+    add("-- held=" .. tostring(held() ~= nil) .. " title=[" .. titleSig() .. "]")
+    add("-- Атрибуты персонажа:")
+    local ac = 0
+    for k, val in pairs(getChar():GetAttributes()) do
+        ac = ac + 1
+        if ac <= 15 then add("  " .. tostring(k) .. "=" .. tostring(val)) end
+    end
+    if pg then
+        add("-- Тексты в тулбаре:")
+        local tc = 0
+        for _, v in ipairs(pg:GetDescendants()) do
+            if tc < 25 and v:IsA("TextLabel") and foreign(v) and norm(v:GetFullName()):find("toolbar", 1, true) then
+                tc = tc + 1
+                add("  " .. v:GetFullName() .. " = [" .. v.Text .. "]")
+            end
+        end
+    end
     add("-- Состояние: clickPref=" .. tostring(clickPref) .. " goodBtn=" .. (goodBtnPath and table.concat(goodBtnPath, ".") or "нет"))
     add("-- Последний лог:")
     for _, l in ipairs(logBuf) do add("  " .. l) end
@@ -840,7 +1100,7 @@ local function getMethods()
             {"обученное",      learned_replay},
             {"слот: клавиша",  slot_hotkey},
             {"слот: GUI",      slot_gui},
-            {"слот: ремоуты",  slot_remotes},
+            {"слот: ремоуты",  smart_remotes},
             {"слот: Backpack", slot_backpack},
             {"модули",         method_modules},
             {"gc",             method_gc},
@@ -848,9 +1108,9 @@ local function getMethods()
     end
     return {
         {"обученное", learned_replay},
-        {"EquipTool", item_humanoid},
-        {"GUI",       item_gui},
-        {"ремоуты",   item_remotes},
+        {"GUI",            item_gui},
+        {"умные ремоуты",  smart_remotes},
+        {"EquipTool",      item_humanoid},
         {"модули",    method_modules},
         {"gc",        method_gc},
         {"клавиши",   item_hotkeys},
@@ -859,17 +1119,25 @@ end
 
 local function doEquip()
     if held() then status("Уже в руках") return true end
+    snapshotChildren()
+    preTitleSig = titleSig()
+    lastAssumed = false
     for _, m in ipairs(getMethods()) do
         if not alive then return false end
         status("Пробую: " .. m[1])
-        local ok, res = pcall(m[2])
+        local ok, res, assumed = pcall(m[2])
         if not ok then log("Ошибка метода", m[1], res) end
-        if ok and res and held() then
+        if ok and res then
             if MODE == "slot" and not slotToolName then
-                local t = heldAny()
+                local t = heldAny() or newChild()
                 if t then slotToolName = t.Name end
             end
-            status("Готово: " .. m[1])
+            if assumed then
+                lastAssumed = true
+                status("Выполнено без проверки: " .. m[1])
+            else
+                status("Готово: " .. m[1])
+            end
             return true
         end
     end
@@ -1109,8 +1377,8 @@ task.spawn(function()
     local nextKeep = 0
     while alive do
         task.wait(1)
-        if KEEP_ON and not busy and os.clock() >= nextKeep then
-            local ok, h = pcall(held)
+        if KEEP_ON and not busy and not lastAssumed and os.clock() >= nextKeep then
+            local ok, h = pcall(isHeldNow)
             if ok and not h then
                 local done = equip()
                 if not done then nextKeep = os.clock() + 8 end
