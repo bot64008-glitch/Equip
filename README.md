@@ -1,27 +1,35 @@
--- God Rock Smart Equip v2
--- Два режима:
---   "item" = экипирует предмет по имени (ITEM_NAME)
---   "slot" = экипирует предмет из слота хотбара (SLOT)
+-- God Rock Smart Equip v3 (с меню)
+-- Меню: режим "Предмет" / "Слот", кнопка экипировки, режим "Держать", сворачивание и закрытие.
 
-local MODE = "item"             -- "item" или "slot"
-local ITEM_NAME = "God Rock"    -- для режима "item"
-local SLOT = 1                  -- для режима "slot" (1-10, где 10 = клавиша 0)
-local KEEP_EQUIPPED = true      -- пере-экипировать, если предмет пропал из рук
+local ITEM_NAME = "God Rock"
+local MODE = "item"        -- "item" или "slot"
+local SLOT = 1             -- 1-10 (10 = клавиша 0)
+local KEEP_ON = false
 local DEBUG = true
 
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
 local GuiService = game:GetService("GuiService")
+local UIS        = game:GetService("UserInputService")
 local VIM        = game:GetService("VirtualInputManager")
 local player     = Players.LocalPlayer
 
-local function log(...) if DEBUG then print("[GodRock]", ...) end end
+-- ============================ ЛОГИКА ============================
 
-local function norm(s)
-    return string.lower((tostring(s):gsub("[%s_%-%.]", "")))
+local ui            -- ScreenGui (заполняется ниже)
+local statusLabel   -- строка статуса в меню
+local alive = true
+
+local function log(...) if DEBUG then print("[GodRock]", ...) end end
+local function status(t)
+    log(t)
+    if statusLabel then statusLabel.Text = t end
 end
+
+local function norm(s) return string.lower((tostring(s):gsub("[%s_%-%.]", ""))) end
 local TARGET = norm(ITEM_NAME)
 local function match(s) return norm(s):find(TARGET, 1, true) ~= nil end
+local function foreign(v) return not (ui and v:IsDescendantOf(ui)) end
 
 local function getChar() return player.Character or player.CharacterAdded:Wait() end
 local function getHum() return getChar():WaitForChild("Humanoid") end
@@ -33,10 +41,8 @@ local function heldAny()
     end
 end
 
--- В режиме "slot" запоминаем, какой предмет оказался в слоте
 local slotToolName = nil
 
--- Нужный предмет в руках?
 local function held()
     local t = heldAny()
     if MODE == "slot" then
@@ -56,8 +62,6 @@ local function waitHeld(t)
     end
     return false
 end
-
--- Общие помощники ---------------------------------------------------------
 
 local REMOTE_WORDS = {"equip", "hold", "select", "tool", "item", "inventory", "backpack", "hotbar", "use", "wield", "slot"}
 local function looksLikeEquip(name)
@@ -79,6 +83,7 @@ local function runRemotes(variants)
     log("Кандидатов-ремоутов:", #list)
     for _, r in ipairs(list) do
         for _, args in ipairs(variants) do
+            if not alive then return false end
             pcall(function()
                 if r:IsA("RemoteEvent") then r:FireServer(table.unpack(args))
                 else r:InvokeServer(table.unpack(args)) end
@@ -132,7 +137,12 @@ local function tapKey(k)
     end)
 end
 
--- РЕЖИМ "item" -------------------------------------------------------------
+local SLOT_KEYS = {
+    Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five,
+    Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine, Enum.KeyCode.Zero,
+}
+
+-- ---------- режим "item" ----------
 
 local function findTool()
     local bp = getBackpack()
@@ -141,9 +151,10 @@ local function findTool()
             if v:IsA("Tool") and match(v.Name) then return v, "Backpack" end
         end
     end
+    local pg = player:FindFirstChildOfClass("PlayerGui")
     for _, root in ipairs({player, getChar()}) do
         for _, v in ipairs(root:GetDescendants()) do
-            if v:IsA("Tool") and match(v.Name) and not v:IsDescendantOf(player:FindFirstChildOfClass("PlayerGui") or game) then
+            if v:IsA("Tool") and match(v.Name) and not (pg and v:IsDescendantOf(pg)) then
                 return v, v:GetFullName()
             end
         end
@@ -163,9 +174,7 @@ end
 
 local function item_remotes()
     local tool = findTool()
-    local variants = {
-        {ITEM_NAME}, {string.lower(ITEM_NAME)}, {ITEM_NAME, true}, {{Name = ITEM_NAME}},
-    }
+    local variants = {{ITEM_NAME}, {string.lower(ITEM_NAME)}, {ITEM_NAME, true}, {{Name = ITEM_NAME}}}
     if tool then table.insert(variants, 1, {tool}) end
     return runRemotes(variants)
 end
@@ -175,28 +184,26 @@ local function item_gui()
     if not pg then return false end
     local seen = {}
     for _, v in ipairs(pg:GetDescendants()) do
-        local hit = false
-        if (v:IsA("TextLabel") or v:IsA("TextButton")) and match(v.Text) then hit = true end
-        if v:IsA("GuiObject") and match(v.Name) then hit = true end
-        if hit then
-            local btn = clickable(v)
-            if btn and not seen[btn] and btn.AbsoluteSize.X > 0 then
-                seen[btn] = true
-                log("GUI-кнопка:", btn:GetFullName())
-                if activate(btn) then return true end
+        if foreign(v) then
+            local hit = false
+            if (v:IsA("TextLabel") or v:IsA("TextButton")) and match(v.Text) then hit = true end
+            if v:IsA("GuiObject") and match(v.Name) then hit = true end
+            if hit then
+                local btn = clickable(v)
+                if btn and not seen[btn] and btn.AbsoluteSize.X > 0 then
+                    seen[btn] = true
+                    log("GUI-кнопка:", btn:GetFullName())
+                    if activate(btn) then return true end
+                end
             end
         end
     end
     return false
 end
 
-local SLOT_KEYS = {
-    Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five,
-    Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine, Enum.KeyCode.Zero,
-}
-
 local function item_hotkeys()
     for i, k in ipairs(SLOT_KEYS) do
+        if not alive then return false end
         tapKey(k)
         if waitHeld(0.3) then log("Сработал слот:", i) return true end
         if heldAny() then
@@ -207,9 +214,8 @@ local function item_hotkeys()
     return false
 end
 
--- РЕЖИМ "slot" -------------------------------------------------------------
+-- ---------- режим "slot" ----------
 
--- 1) Нажатие клавиши слота (работает и для стандартного, и для большинства кастомных хотбаров)
 local function slot_hotkey()
     local k = SLOT_KEYS[SLOT]
     if not k then return false end
@@ -217,36 +223,34 @@ local function slot_hotkey()
     return waitHeld(0.5)
 end
 
--- 2) Клик по кнопке слота в GUI (ищем кнопку с номером слота)
 local function slot_gui()
     local pg = player:FindFirstChildOfClass("PlayerGui")
     if not pg then return false end
     local num = tostring(SLOT)
     local seen = {}
     for _, v in ipairs(pg:GetDescendants()) do
-        local hit = false
-        if (v:IsA("TextLabel") or v:IsA("TextButton")) and norm(v.Text) == num then hit = true end
-        if v:IsA("GuiObject") then
-            local n = norm(v.Name)
-            if n == num or n == "slot" .. num or n == "hotbarslot" .. num or n == "item" .. num then hit = true end
-        end
-        if hit then
-            local btn = clickable(v)
-            if btn and not seen[btn] and btn.AbsoluteSize.X > 0 then
-                seen[btn] = true
-                log("Кнопка слота:", btn:GetFullName())
-                if activate(btn) then return true end
+        if foreign(v) then
+            local hit = false
+            if (v:IsA("TextLabel") or v:IsA("TextButton")) and norm(v.Text) == num then hit = true end
+            if v:IsA("GuiObject") then
+                local n = norm(v.Name)
+                if n == num or n == "slot" .. num or n == "hotbarslot" .. num or n == "item" .. num then hit = true end
+            end
+            if hit then
+                local btn = clickable(v)
+                if btn and not seen[btn] and btn.AbsoluteSize.X > 0 then
+                    seen[btn] = true
+                    log("Кнопка слота:", btn:GetFullName())
+                    if activate(btn) then return true end
+                end
             end
         end
     end
     return false
 end
 
--- 3) Ремоуты со слотом / предметом по порядку
 local function slot_remotes()
-    local variants = {
-        {SLOT}, {tostring(SLOT)}, {"Slot" .. SLOT}, {"Slot", SLOT}, {SLOT, true},
-    }
+    local variants = {{SLOT}, {tostring(SLOT)}, {"Slot" .. SLOT}, {"Slot", SLOT}, {SLOT, true}}
     local bp = getBackpack()
     if bp then
         local i = 0
@@ -260,7 +264,6 @@ local function slot_remotes()
     return runRemotes(variants)
 end
 
--- 4) Запасной вариант: N-й Tool в Backpack (порядок может не совпадать с хотбаром)
 local function slot_backpack()
     local bp = getBackpack()
     if not bp then return false end
@@ -277,56 +280,256 @@ local function slot_backpack()
     return false
 end
 
--- Выбор методов -------------------------------------------------------------
-
-local methods
-if MODE == "slot" then
-    methods = {
-        {"Slot: hotkey",   slot_hotkey},
-        {"Slot: GUI",      slot_gui},
-        {"Slot: remotes",  slot_remotes},
-        {"Slot: backpack", slot_backpack},
-    }
-else
-    methods = {
-        {"Humanoid:EquipTool", item_humanoid},
-        {"Remotes",            item_remotes},
-        {"GUI",                item_gui},
-        {"Hotkeys",            item_hotkeys},
+local function getMethods()
+    if MODE == "slot" then
+        return {
+            {"слот: клавиша",  slot_hotkey},
+            {"слот: GUI",      slot_gui},
+            {"слот: ремоуты",  slot_remotes},
+            {"слот: Backpack", slot_backpack},
+        }
+    end
+    return {
+        {"EquipTool", item_humanoid},
+        {"ремоуты",   item_remotes},
+        {"GUI",       item_gui},
+        {"клавиши",   item_hotkeys},
     }
 end
 
-local function equip()
-    if held() then return true end
+-- ---------- запуск экипировки ----------
 
-    -- в руках не тот предмет (или первый запуск в режиме слота) — сначала убираем
+local busy = false
+
+local function doEquip()
+    if held() then status("Уже в руках") return true end
     if heldAny() then
         pcall(function() getHum():UnequipTools() end)
         task.wait(0.15)
     end
-
-    for _, m in ipairs(methods) do
-        log("Пробую:", m[1])
+    for _, m in ipairs(getMethods()) do
+        if not alive then return false end
+        status("Пробую: " .. m[1])
         local ok, res = pcall(m[2])
         if ok and res and held() then
             if MODE == "slot" and not slotToolName then
                 slotToolName = heldAny().Name
-                log("В слоте", SLOT, "предмет:", slotToolName)
             end
-            log("Готово через", m[1])
+            status("Готово: " .. m[1])
             return true
         end
     end
-    log("Не удалось экипировать", MODE == "slot" and ("слот " .. SLOT) or ITEM_NAME)
+    status("Не удалось экипировать")
     return false
 end
 
-equip()
-
-if KEEP_EQUIPPED then
-    task.spawn(function()
-        while task.wait(1) do
-            if not held() then equip() end
-        end
-    end)
+local function equip()
+    if busy then return false end
+    busy = true
+    local ok, res = pcall(doEquip)
+    if not ok then status("Ошибка: " .. tostring(res)) end
+    busy = false
+    return ok and res
 end
+
+-- ============================ МЕНЮ ============================
+
+local BLACK  = Color3.fromRGB(15, 15, 15)
+local DARK   = Color3.fromRGB(30, 30, 30)
+local GRAY   = Color3.fromRGB(70, 70, 70)
+local LGRAY  = Color3.fromRGB(150, 150, 150)
+local YELLOW = Color3.fromRGB(255, 200, 0)
+local WHITE  = Color3.fromRGB(255, 255, 255)
+
+local function guiParent()
+    if typeof(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok and h then return h end
+    end
+    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+    if ok and cg then
+        local t = Instance.new("Folder")
+        local okp = pcall(function() t.Parent = cg end)
+        t:Destroy()
+        if okp then return cg end
+    end
+    return player:WaitForChild("PlayerGui")
+end
+
+local function make(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local function corner(o, r) make("UICorner", {CornerRadius = UDim.new(0, r or 6)}, o) end
+
+local function button(text, pos, size, parent)
+    local b = make("TextButton", {
+        Text = text, Position = pos, Size = size, BackgroundColor3 = GRAY, TextColor3 = WHITE,
+        Font = Enum.Font.GothamBold, TextSize = 14, AutoButtonColor = false, BorderSizePixel = 0,
+    }, parent)
+    corner(b)
+    return b
+end
+
+-- убираем старое меню при повторном запуске
+pcall(function()
+    local p = guiParent()
+    local old = p:FindFirstChild("GodRockEquipUI")
+    if old then old:Destroy() end
+end)
+
+ui = make("ScreenGui", {Name = "GodRockEquipUI", ResetOnSpawn = false, DisplayOrder = 999, IgnoreGuiInset = true}, guiParent())
+
+local main = make("Frame", {
+    Size = UDim2.fromOffset(230, 236), Position = UDim2.new(0.5, -115, 0.25, 0),
+    BackgroundColor3 = BLACK, BorderSizePixel = 0,
+}, ui)
+corner(main, 8)
+make("UIStroke", {Color = YELLOW, Thickness = 2}, main)
+
+local bar = make("Frame", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = DARK, BorderSizePixel = 0}, main)
+corner(bar, 8)
+make("TextLabel", {
+    Text = "GOD ROCK EQUIP", Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -80, 1, 0),
+    BackgroundTransparency = 1, TextColor3 = YELLOW, Font = Enum.Font.GothamBold, TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, bar)
+local minBtn   = button("–", UDim2.new(1, -62, 0, 3), UDim2.fromOffset(26, 24), bar)
+local closeBtn = button("X", UDim2.new(1, -32, 0, 3), UDim2.fromOffset(26, 24), bar)
+closeBtn.BackgroundColor3 = Color3.fromRGB(170, 40, 40)
+
+local body = make("Frame", {
+    Position = UDim2.fromOffset(0, 30), Size = UDim2.new(1, 0, 0, 206), BackgroundTransparency = 1,
+}, main)
+
+local modeItem = button("ПРЕДМЕТ", UDim2.fromOffset(10, 8),   UDim2.fromOffset(100, 30), body)
+local modeSlot = button("СЛОТ",    UDim2.fromOffset(120, 8),  UDim2.fromOffset(100, 30), body)
+
+local itemBox = make("TextBox", {
+    Text = ITEM_NAME, PlaceholderText = "Имя предмета", Position = UDim2.fromOffset(10, 46),
+    Size = UDim2.fromOffset(210, 30), BackgroundColor3 = DARK, TextColor3 = WHITE,
+    PlaceholderColor3 = LGRAY, Font = Enum.Font.Gotham, TextSize = 14, ClearTextOnFocus = false,
+    BorderSizePixel = 0,
+}, body)
+corner(itemBox)
+
+local slotRow = make("Frame", {Position = UDim2.fromOffset(10, 46), Size = UDim2.fromOffset(210, 30), BackgroundTransparency = 1}, body)
+local slotMinus = button("-", UDim2.fromOffset(0, 0),   UDim2.fromOffset(40, 30), slotRow)
+local slotLabel = make("TextLabel", {
+    Text = "Слот " .. SLOT, Position = UDim2.fromOffset(50, 0), Size = UDim2.fromOffset(110, 30),
+    BackgroundColor3 = DARK, TextColor3 = YELLOW, Font = Enum.Font.GothamBold, TextSize = 14, BorderSizePixel = 0,
+}, slotRow)
+corner(slotLabel)
+local slotPlus = button("+", UDim2.fromOffset(170, 0), UDim2.fromOffset(40, 30), slotRow)
+
+local equipBtn = button("ЭКИПИРОВАТЬ", UDim2.fromOffset(10, 84), UDim2.fromOffset(210, 36), body)
+equipBtn.BackgroundColor3 = YELLOW
+equipBtn.TextColor3 = BLACK
+equipBtn.TextSize = 15
+
+local keepBtn = button("Держать: ВЫКЛ", UDim2.fromOffset(10, 128), UDim2.fromOffset(210, 30), body)
+
+statusLabel = make("TextLabel", {
+    Text = "Готов", Position = UDim2.fromOffset(10, 166), Size = UDim2.fromOffset(210, 34),
+    BackgroundTransparency = 1, TextColor3 = LGRAY, Font = Enum.Font.Gotham, TextSize = 12,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+}, body)
+
+local function refreshMode()
+    local isItem = MODE == "item"
+    modeItem.BackgroundColor3 = isItem and YELLOW or GRAY
+    modeItem.TextColor3 = isItem and BLACK or WHITE
+    modeSlot.BackgroundColor3 = isItem and GRAY or YELLOW
+    modeSlot.TextColor3 = isItem and WHITE or BLACK
+    itemBox.Visible = isItem
+    slotRow.Visible = not isItem
+    slotToolName = nil
+end
+local function refreshKeep()
+    keepBtn.Text = "Держать: " .. (KEEP_ON and "ВКЛ" or "ВЫКЛ")
+    keepBtn.BackgroundColor3 = KEEP_ON and YELLOW or GRAY
+    keepBtn.TextColor3 = KEEP_ON and BLACK or WHITE
+end
+refreshMode()
+refreshKeep()
+
+local conns = {}
+
+modeItem.MouseButton1Click:Connect(function() MODE = "item" refreshMode() end)
+modeSlot.MouseButton1Click:Connect(function() MODE = "slot" refreshMode() end)
+
+itemBox.FocusLost:Connect(function()
+    local t = itemBox.Text
+    if t ~= "" then ITEM_NAME = t TARGET = norm(t) end
+    slotToolName = nil
+end)
+
+slotMinus.MouseButton1Click:Connect(function()
+    SLOT = SLOT - 1
+    if SLOT < 1 then SLOT = 10 end
+    slotLabel.Text = "Слот " .. SLOT
+    slotToolName = nil
+end)
+slotPlus.MouseButton1Click:Connect(function()
+    SLOT = SLOT + 1
+    if SLOT > 10 then SLOT = 1 end
+    slotLabel.Text = "Слот " .. SLOT
+    slotToolName = nil
+end)
+
+equipBtn.MouseButton1Click:Connect(function() task.spawn(equip) end)
+
+keepBtn.MouseButton1Click:Connect(function()
+    KEEP_ON = not KEEP_ON
+    refreshKeep()
+    if KEEP_ON then task.spawn(equip) end
+end)
+
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    body.Visible = not minimized
+    main.Size = minimized and UDim2.fromOffset(230, 30) or UDim2.fromOffset(230, 236)
+    minBtn.Text = minimized and "+" or "–"
+end)
+
+local function shutdown()
+    alive = false
+    KEEP_ON = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    pcall(function() ui:Destroy() end)
+end
+closeBtn.MouseButton1Click:Connect(shutdown)
+
+-- перетаскивание за заголовок (мышь и тач)
+local dragging, dragStart, startPos
+bar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+table.insert(conns, UIS.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end))
+
+-- цикл "Держать"
+task.spawn(function()
+    while alive do
+        task.wait(1)
+        if KEEP_ON and not busy then
+            local ok, h = pcall(held)
+            if ok and not h then equip() end
+        end
+    end
+end)
