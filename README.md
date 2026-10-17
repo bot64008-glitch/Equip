@@ -7,6 +7,14 @@ local SLOT = 1             -- 1-10 (10 = клавиша 0)
 local KEEP_ON = false
 local DEBUG = true
 
+-- Показ ошибок на экране (на телефоне консоль неудобна)
+local function notify(title, text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {Title = title, Text = tostring(text), Duration = 8})
+    end)
+end
+
+local function main()
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
 local GuiService = game:GetService("GuiService")
@@ -256,7 +264,7 @@ local function slot_remotes()
         local i = 0
         for _, v in ipairs(bp:GetChildren()) do
             if v:IsA("Tool") then
-                i += 1
+                i = i + 1
                 if i == SLOT then table.insert(variants, 1, {v}) break end
             end
         end
@@ -270,7 +278,7 @@ local function slot_backpack()
     local i = 0
     for _, v in ipairs(bp:GetChildren()) do
         if v:IsA("Tool") then
-            i += 1
+            i = i + 1
             if i == SLOT then
                 pcall(function() getHum():EquipTool(v) end)
                 return waitHeld()
@@ -342,18 +350,13 @@ local YELLOW = Color3.fromRGB(255, 200, 0)
 local WHITE  = Color3.fromRGB(255, 255, 255)
 
 local function guiParent()
+    local pg = player:FindFirstChildOfClass("PlayerGui") or player:WaitForChild("PlayerGui", 10)
+    if pg then return pg end
     if typeof(gethui) == "function" then
         local ok, h = pcall(gethui)
         if ok and h then return h end
     end
-    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
-    if ok and cg then
-        local t = Instance.new("Folder")
-        local okp = pcall(function() t.Parent = cg end)
-        t:Destroy()
-        if okp then return cg end
-    end
-    return player:WaitForChild("PlayerGui")
+    return game:GetService("CoreGui")
 end
 
 local function make(class, props, parent)
@@ -383,6 +386,8 @@ end)
 
 ui = make("ScreenGui", {Name = "GodRockEquipUI", ResetOnSpawn = false, DisplayOrder = 999, IgnoreGuiInset = true}, guiParent())
 
+if not ui or not ui.Parent then error("меню не прикрепилось к экрану") end
+
 local main = make("Frame", {
     Size = UDim2.fromOffset(230, 236), Position = UDim2.new(0.5, -115, 0.25, 0),
     BackgroundColor3 = BLACK, BorderSizePixel = 0,
@@ -397,7 +402,7 @@ make("TextLabel", {
     BackgroundTransparency = 1, TextColor3 = YELLOW, Font = Enum.Font.GothamBold, TextSize = 14,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, bar)
-local minBtn   = button("–", UDim2.new(1, -62, 0, 3), UDim2.fromOffset(26, 24), bar)
+local minBtn   = button("-", UDim2.new(1, -62, 0, 3), UDim2.fromOffset(26, 24), bar)
 local closeBtn = button("X", UDim2.new(1, -32, 0, 3), UDim2.fromOffset(26, 24), bar)
 closeBtn.BackgroundColor3 = Color3.fromRGB(170, 40, 40)
 
@@ -458,8 +463,8 @@ refreshKeep()
 
 local conns = {}
 
-modeItem.MouseButton1Click:Connect(function() MODE = "item" refreshMode() end)
-modeSlot.MouseButton1Click:Connect(function() MODE = "slot" refreshMode() end)
+modeItem.Activated:Connect(function() MODE = "item" refreshMode() end)
+modeSlot.Activated:Connect(function() MODE = "slot" refreshMode() end)
 
 itemBox.FocusLost:Connect(function()
     local t = itemBox.Text
@@ -467,33 +472,33 @@ itemBox.FocusLost:Connect(function()
     slotToolName = nil
 end)
 
-slotMinus.MouseButton1Click:Connect(function()
+slotMinus.Activated:Connect(function()
     SLOT = SLOT - 1
     if SLOT < 1 then SLOT = 10 end
     slotLabel.Text = "Слот " .. SLOT
     slotToolName = nil
 end)
-slotPlus.MouseButton1Click:Connect(function()
+slotPlus.Activated:Connect(function()
     SLOT = SLOT + 1
     if SLOT > 10 then SLOT = 1 end
     slotLabel.Text = "Слот " .. SLOT
     slotToolName = nil
 end)
 
-equipBtn.MouseButton1Click:Connect(function() task.spawn(equip) end)
+equipBtn.Activated:Connect(function() task.spawn(equip) end)
 
-keepBtn.MouseButton1Click:Connect(function()
+keepBtn.Activated:Connect(function()
     KEEP_ON = not KEEP_ON
     refreshKeep()
     if KEEP_ON then task.spawn(equip) end
 end)
 
 local minimized = false
-minBtn.MouseButton1Click:Connect(function()
+minBtn.Activated:Connect(function()
     minimized = not minimized
     body.Visible = not minimized
     main.Size = minimized and UDim2.fromOffset(230, 30) or UDim2.fromOffset(230, 236)
-    minBtn.Text = minimized and "+" or "–"
+    minBtn.Text = minimized and "+" or "-"
 end)
 
 local function shutdown()
@@ -502,7 +507,7 @@ local function shutdown()
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     pcall(function() ui:Destroy() end)
 end
-closeBtn.MouseButton1Click:Connect(shutdown)
+closeBtn.Activated:Connect(shutdown)
 
 -- перетаскивание за заголовок (мышь и тач)
 local dragging, dragStart, startPos
@@ -533,3 +538,12 @@ task.spawn(function()
         end
     end
 end)
+
+    notify("God Rock Equip", "Меню загружено")
+end
+
+local ok, err = xpcall(main, function(e) return tostring(e) .. "\n" .. debug.traceback() end)
+if not ok then
+    warn("[GodRock] ОШИБКА: " .. tostring(err))
+    notify("God Rock: ошибка", string.sub(tostring(err), 1, 200))
+end
