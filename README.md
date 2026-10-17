@@ -1,4 +1,4 @@
--- God Rock Smart Equip v4
+-- God Rock Smart Equip v5
 -- Новое: ОБУЧЕНИЕ (скрипт запоминает, как ты экипируешь вручную), СКАН (отчёт в буфер),
 -- вызов модулей игры, поиск не только Tool, более безопасные клики.
 
@@ -30,7 +30,16 @@ local itemBoxRef
 local alive = true
 local busy = false
 
-local function log(...) if DEBUG then print("[GodRock]", ...) end end
+local logBuf = {}
+local function log(...)
+    local n = select("#", ...)
+    local parts = {}
+    for i = 1, n do parts[i] = tostring((select(i, ...))) end
+    local line = table.concat(parts, " ")
+    table.insert(logBuf, line)
+    if #logBuf > 80 then table.remove(logBuf, 1) end
+    if DEBUG then print("[GodRock]", line) end
+end
 local function status(t)
     log(t)
     if statusLabel then statusLabel.Text = t end
@@ -51,10 +60,21 @@ local function heldAny()
     end
 end
 
--- любой объект с нужным именем на персонаже (на случай, если предмет не Tool)
-local function findInChar()
+-- предмет, который не Tool (Model/Accessory/деталь) и появился ПОСЛЕ снимка
+local baseline = {}
+local function snapshotBaseline()
+    baseline = {}
+    local ok, c = pcall(getChar)
+    if not ok or not c then return end
+    for _, v in ipairs(c:GetDescendants()) do
+        if match(v.Name) then baseline[v] = true end
+    end
+end
+local function nonToolMatch()
     for _, v in ipairs(getChar():GetDescendants()) do
-        if match(v.Name) and not v:IsA("Humanoid") then return v end
+        if not baseline[v] and match(v.Name) and (v:IsA("Model") or v:IsA("Accessory") or v:IsA("BasePart")) then
+            if not (v:IsA("BasePart") and v.Transparency >= 1) then return v end
+        end
     end
 end
 
@@ -69,7 +89,7 @@ local function held()
     for _, v in ipairs(getChar():GetChildren()) do
         if v:IsA("Tool") and match(v.Name) then return v end
     end
-    return findInChar()
+    return nonToolMatch()
 end
 
 local function waitHeld(t)
@@ -123,6 +143,59 @@ local function clickable(obj)
     end
 end
 
+-- ---------- клики ----------
+
+local function relPath(inst, root)
+    local names = {}
+    local o = inst
+    while o and o ~= root do
+        table.insert(names, 1, o.Name)
+        o = o.Parent
+    end
+    return names
+end
+
+local function resolvePath(names)
+    local o = player:FindFirstChildOfClass("PlayerGui")
+    for _, n in ipairs(names) do
+        if not o then return nil end
+        o = o:FindFirstChild(n)
+    end
+    return o
+end
+
+local clickPref = nil        -- "signal" или "real": что сработало раньше
+local goodBtnPath = nil      -- путь к кнопке предмета, которая уже срабатывала
+local goodSlotPaths = {}     -- то же для кнопок слотов
+
+-- не нажимаем на магазины, обмены, яйца и т.п.
+local BAD_WORDS = {"shop", "store", "buy", "purchase", "market", "trade", "sell", "gift",
+    "robux", "crate", "egg", "auction", "gamepass", "codex"}
+local function isBad(o)
+    local x = o
+    while x and not x:IsA("PlayerGui") do
+        local n = norm(x.Name)
+        for _, w in ipairs(BAD_WORDS) do
+            if n:find(w, 1, true) then return true end
+        end
+        x = x.Parent
+    end
+    return false
+end
+
+local function isVisible(g)
+    local o = g
+    while o and not o:IsA("PlayerGui") do
+        if o:IsA("GuiObject") and not o.Visible then return false end
+        if o:IsA("LayerCollector") and not o.Enabled then return false end
+        o = o.Parent
+    end
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(2000, 2000)
+    local p = g.AbsolutePosition + g.AbsoluteSize / 2
+    return g.AbsoluteSize.X > 0 and g.AbsoluteSize.Y > 0 and p.X >= 0 and p.Y >= 0 and p.X <= vp.X and p.Y <= vp.Y
+end
+
 -- одиночный реальный клик по центру кнопки
 local function clickOnce(btn)
     if not btn or not btn.Parent then return false end
@@ -141,16 +214,71 @@ local function clickOnce(btn)
     return true
 end
 
--- клик "на удачу": сначала сигналы, ждём результат, и только потом реальный клик
+local function fireSignals(btn)
+    for _, sig in ipairs({"MouseButton1Down", "MouseButton1Up", "MouseButton1Click", "Activated"}) do
+        pcall(function() firesignal(btn[sig]) end)
+    end
+end
+
+-- Нажатие кнопки ОДНИМ способом за раз и долгое ожидание результата
+-- (двойное срабатывание у кастомных систем = экипировал и сразу снял).
 local function activate(btn)
-    if typeof(firesignal) == "function" then
-        for _, sig in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down", "MouseButton1Up"}) do
-            pcall(function() firesignal(btn[sig]) end)
+    local order = {"signal", "real"}
+    if clickPref == "real" then order = {"real", "signal"} end
+    for _, kind in ipairs(order) do
+        local fired = false
+        if kind == "signal" and typeof(firesignal) == "function" then
+            fireSignals(btn)
+            fired = true
+        elseif kind == "real" then
+            clickOnce(btn)
+            fired = true
+        end
+        if fired then
+            log("Клик способом:", kind)
+            if waitHeld(1.8) then
+                clickPref = kind
+                return true
+            end
         end
     end
-    if waitHeld(0.5) then return true end
-    clickOnce(btn)
-    return waitHeld(0.6)
+    return false
+end
+
+local function collectButtons(test)
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    local list, seen = {}, {}
+    if not pg then return list end
+    for _, v in ipairs(pg:GetDescendants()) do
+        if foreign(v) and test(v) then
+            local b = clickable(v)
+            if b and not seen[b] and isVisible(b) and not isBad(b) then
+                seen[b] = true
+                table.insert(list, b)
+            end
+        end
+    end
+    return list
+end
+
+-- если кнопки предмета не видно, пробуем открыть инвентарь
+local INV_WORDS = {"inventory", "backpack", "bag", "items", "inv"}
+local function openInventory()
+    local btns = collectButtons(function(v)
+        local n = norm(v.Name)
+        local t = ""
+        if v:IsA("TextLabel") or v:IsA("TextButton") then t = norm(v.Text) end
+        for _, w in ipairs(INV_WORDS) do
+            if n == w or t == w then return true end
+        end
+        return false
+    end)
+    local b = btns[1]
+    if not b then return false end
+    log("Открываю инвентарь:", b:GetFullName())
+    clickOnce(b)
+    task.wait(0.7)
+    return true
 end
 
 local function tapKey(k)
@@ -206,20 +334,27 @@ end
 local function item_gui()
     local pg = player:FindFirstChildOfClass("PlayerGui")
     if not pg then return false end
-    local seen = {}
-    for _, v in ipairs(pg:GetDescendants()) do
-        if foreign(v) then
-            local hit = false
-            if (v:IsA("TextLabel") or v:IsA("TextButton")) and match(v.Text) then hit = true end
-            if v:IsA("GuiObject") and match(v.Name) then hit = true end
-            if hit then
-                local btn = clickable(v)
-                if btn and not seen[btn] and btn.AbsoluteSize.X > 0 then
-                    seen[btn] = true
-                    log("GUI-кнопка:", btn:GetFullName())
-                    if activate(btn) then return true end
-                end
-            end
+    local function test(v)
+        if (v:IsA("TextLabel") or v:IsA("TextButton")) and match(v.Text) then return true end
+        return v:IsA("GuiObject") and match(v.Name)
+    end
+    -- 1) кнопка, которая уже срабатывала
+    if goodBtnPath then
+        local b = resolvePath(goodBtnPath)
+        if b and b:IsA("GuiButton") and isVisible(b) then
+            log("Кеш-кнопка:", b:GetFullName())
+            if activate(b) then return true end
+        end
+    end
+    -- 2) поиск заново (видимые кнопки, без магазинов)
+    local cands = collectButtons(test)
+    if #cands == 0 and openInventory() then cands = collectButtons(test) end
+    for i, b in ipairs(cands) do
+        if i > 4 or not alive then break end
+        log("GUI-кнопка:", b:GetFullName())
+        if activate(b) then
+            goodBtnPath = relPath(b, pg)
+            return true
         end
     end
     return false
@@ -263,23 +398,28 @@ local function slot_gui()
     local pg = player:FindFirstChildOfClass("PlayerGui")
     if not pg then return false end
     local num = tostring(SLOT)
-    local seen = {}
-    for _, v in ipairs(pg:GetDescendants()) do
-        if foreign(v) then
-            local hit = false
-            if (v:IsA("TextLabel") or v:IsA("TextButton")) and norm(v.Text) == num then hit = true end
-            if v:IsA("GuiObject") then
-                local n = norm(v.Name)
-                if n == num or n == "slot" .. num or n == "hotbarslot" .. num or n == "item" .. num then hit = true end
-            end
-            if hit then
-                local btn = clickable(v)
-                if btn and not seen[btn] and btn.AbsoluteSize.X > 0 then
-                    seen[btn] = true
-                    log("Кнопка слота:", btn:GetFullName())
-                    if activate(btn) then return true end
-                end
-            end
+    local function test(v)
+        if (v:IsA("TextLabel") or v:IsA("TextButton")) and norm(v.Text) == num then return true end
+        if v:IsA("GuiObject") then
+            local n = norm(v.Name)
+            return n == num or n == "slot" .. num or n == "hotbarslot" .. num or n == "item" .. num
+        end
+        return false
+    end
+    local cp = goodSlotPaths[SLOT]
+    if cp then
+        local b = resolvePath(cp)
+        if b and b:IsA("GuiButton") and isVisible(b) then
+            if activate(b) then return true end
+        end
+    end
+    local cands = collectButtons(test)
+    for i, b in ipairs(cands) do
+        if i > 4 or not alive then break end
+        log("Кнопка слота:", b:GetFullName())
+        if activate(b) then
+            goodSlotPaths[SLOT] = relPath(b, pg)
+            return true
         end
     end
     return false
@@ -465,9 +605,16 @@ end
 local function startLearn()
     if learning then return end
     if heldAny() then
-        pcall(function() getHum():UnequipTools() end)
-        task.wait(0.4)
+        status("Сними предмет вручную (как обычно)...")
+        local w0 = os.clock()
+        while alive and heldAny() and os.clock() - w0 < 15 do task.wait(0.2) end
+        if heldAny() then
+            status("Обучение отменено: предмет всё ещё в руках")
+            return
+        end
+        task.wait(0.5)
     end
+    snapshotBaseline()
     learnCalls, learnClicks, learnKeys = {}, {}, {}
     learning = true
     status("ОБУЧЕНИЕ: экипируй предмет вручную (20 сек)")
@@ -671,6 +818,10 @@ local function scan()
         end
     end
 
+    add("-- Состояние: clickPref=" .. tostring(clickPref) .. " goodBtn=" .. (goodBtnPath and table.concat(goodBtnPath, ".") or "нет"))
+    add("-- Последний лог:")
+    for _, l in ipairs(logBuf) do add("  " .. l) end
+
     local report = table.concat(lines, "\n")
     print(report)
     if typeof(setclipboard) == "function" then
@@ -698,8 +849,8 @@ local function getMethods()
     return {
         {"обученное", learned_replay},
         {"EquipTool", item_humanoid},
-        {"ремоуты",   item_remotes},
         {"GUI",       item_gui},
+        {"ремоуты",   item_remotes},
         {"модули",    method_modules},
         {"gc",        method_gc},
         {"клавиши",   item_hotkeys},
@@ -708,10 +859,6 @@ end
 
 local function doEquip()
     if held() then status("Уже в руках") return true end
-    if heldAny() then
-        pcall(function() getHum():UnequipTools() end)
-        task.wait(0.2)
-    end
     for _, m in ipairs(getMethods()) do
         if not alive then return false end
         status("Пробую: " .. m[1])
@@ -740,6 +887,11 @@ local function equip()
 end
 
 hookOk = installHook()
+task.spawn(snapshotBaseline)
+player.CharacterAdded:Connect(function()
+    task.wait(1.5)
+    snapshotBaseline()
+end)
 
 -- ============================ МЕНЮ ============================
 
@@ -952,13 +1104,17 @@ table.insert(conns, UIS.InputChanged:Connect(function(input)
     end
 end))
 
--- цикл "Держать"
+-- цикл "Держать" (после неудачи пауза, чтобы не спамить кликами)
 task.spawn(function()
+    local nextKeep = 0
     while alive do
         task.wait(1)
-        if KEEP_ON and not busy then
+        if KEEP_ON and not busy and os.clock() >= nextKeep then
             local ok, h = pcall(held)
-            if ok and not h then equip() end
+            if ok and not h then
+                local done = equip()
+                if not done then nextKeep = os.clock() + 8 end
+            end
         end
     end
 end)
